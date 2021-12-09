@@ -2,7 +2,7 @@ from datetime import timedelta
 
 from constants import *
 
-DT_PROC = datetime.now().date() - timedelta(days=1)
+DT_PROC = (datetime.now() - timedelta(days=1)).date()
 
 
 class DefaultArgs:
@@ -17,4 +17,4 @@ class DefaultArgs:
 
     @property
     def dt(self):
-        return DT_PROC if not self._dt else self._dt
+        return DT_PROC if not self._dt else datetime.strptime(self._dt, '%Y-%m-%d %H:%M:%S').date()

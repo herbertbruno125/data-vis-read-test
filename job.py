@@ -1,10 +1,12 @@
 from datetime import timedelta
 from sys import argv
 
+from pyspark.sql import Window
 from pyspark.sql.functions import *
 
+from constants import *
 from default_args import DefaultArgs
-from utils import get_session
+from utils import get_session, persisted
 
 
 class Job(DefaultArgs):
@@ -12,27 +14,55 @@ class Job(DefaultArgs):
     def __init__(self, environment, dt) -> None:
         super().__init__(environment, dt)
         self.spark = get_session()
+        self.behavior_path = f's3a://raw-bucket/behaviors'
+        self.dir_value = f's3a://staged-bucket/behavior/output/{self.dt}'
 
-    def get_min_proc(self):
+    def __amount_sales_path(self, customer):
+        default_path = f's3a://curated-bucket/campaign_results'
+        prefix_path = f'{self.dt}/events/{customer}'
+        return '{}/{}/*.csv'.format(default_path, prefix_path)
+
+    def __get_min_proc(self):
         return self.dt - timedelta(days=7)
 
     def runner(self):
         mutable_df = self.spark.read.format("org.apache.spark.sql.cassandra") \
-            .options(table='communication', keyspace='mutable_date').load()
+            .options(table='consolidated_person', keyspace='sminer').load()
 
-        mutable_df = mutable_df.filter(col('customer') == 1)
+        for customer in CUSTOMERS:
+            mutable_people = mutable_df.filter(col('customerid') == customer) \
+                .select('personid').distinct().collect()
 
-        behavior_df = self.spark.read.parquet(f's3a://raw_data_sm/behavior/customer')
+            people_values = [s[0] for s in mutable_people]
 
-        behavior_df = behavior_df.filter(col('date') >= self.get_min_proc() & col('date') <= self.dt)
+            behavior_df = self.spark.read.parquet(self.behavior_path)
 
-        person_behavior = behavior_df.select('person_id').distinct().collect()
+            between_min = self.__get_min_proc()
 
-        person_behavior_values = [s[0] for s in person_behavior]
+            behavior_df = behavior_df.where(col('date').between(str(between_min), str(self.dt)))
 
-        person_communication = mutable_df.filter(col('personid').isin(person_behavior_values)).collect()
+            behavior_df = behavior_df.withColumn('is_communication', when(col('personid').isin(people_values), True)) \
+                .filter(col('is_communication').isNotNull()).drop('is_communication')
 
-        person_communication_df
+            df_behavior_grpy = behavior_df.groupBy('CustomerId', 'PersonId').count()
+
+            pre_sales = self.spark.read.csv(self.__amount_sales_path(customer), header=True,
+                                            sep='\t').filter(col('Type').isin(TYPES))
+
+            ranking = Window.partitionBy('customerid', 'PersonId').orderBy('createdate')
+
+            df_join_func = df_behavior_grpy.join(pre_sales, 'PersonId', 'outer')\
+                .withColumn('row_number_col', row_number().over(ranking)) \
+                .filter(col('row_number_col') == 1).drop('row_number_col')
+
+            df_del = self.spark.read.csv(
+                f's3a://staged/behavior/output/{self.dt - timedelta(days=1)}').withColumnRenamed('personid',
+                                                                                                 'personiddelta')
+
+            df_dist_delta = df_join_func.join(df_del, ['customerid', 'personid'], 'left').filter(
+                col('personiddelta').isNull())
+
+            persisted(df_dist_delta, self.dir_value)
 
 
 if __name__ == '__main__':
